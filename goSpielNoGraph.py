@@ -10,9 +10,10 @@
 # V6: fehler im auszählen: and not in neueLeereFelder, beenden mit zugNr 81, ko bei vonBeginn=False
 # V7: tote schlagen mit 2 fh bei auszählen
 # V8: ZUG_MAX als class par, schlageStein: fh=0, doppelt reihe var in fhUpdate
+# V9: sgfWrite
 #
 
-import copy, gameGo
+import os, copy, gameGo
 
 KOMI = 6.5
 
@@ -80,6 +81,44 @@ class PlayGo:
 
         gameGo.printBrett(board)
         print('')
+
+    def sgfWrite(self, zuege, values):
+        # Writes sgfFile including values in root
+        # parameter zuege: list of actions
+        # parameter values: list of strings 0.xx
+        os.chdir('/Users/kai/Documents/Python/ML/go9x9test')
+        i = 1
+        while os.path.isfile('go' + '-' + str(i) + '.sgf'):
+                i += 1
+        file = open('go' + '-' + str(i) + '.sgf', 'w')
+        if self.gewinner == 1:
+            file.write('(;RE[B+0]\n')
+        elif self.gewinner == -1:
+            file.write('(;RE[W+0]\n')
+
+        file.write('EV[')
+        for i in range(len(values)):
+            file.write(values[i])
+            if i < len(values)-1:
+                file.write(',')
+        file.write(']\n\n')
+
+        if self.zugNr > self.zugMax:
+            zuege.append(81)
+            zuege.append(81)
+
+        for i in range(len(zuege)):
+            if i%2 == 0:
+                farbe = 'B'
+            else:
+                farbe = 'W'
+            if zuege[i] == 81:  # pass
+                file.write(';' + farbe + '[]')
+            else:
+                file.write(';' + farbe + '[' + PlayGo.col[zuege[i]%9] + PlayGo.col[zuege[i]//9] + ']')
+
+        file.write('\n)')
+        file.close()
 
     def auszaehlen(self):
         # return: Punkte für schwarz, weiß
