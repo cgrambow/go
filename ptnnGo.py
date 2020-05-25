@@ -19,6 +19,7 @@
 # V7: drehung
 # V8: ZUG_MAX bei SL 81
 # V9: GPU
+# V10:predict auf ANZ_POSITIONS geändert, sgfWrite bei playGame
 #
 import torch, torch.cuda
 import torch.nn as nn
@@ -26,7 +27,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 import numpy as np
-import copy, os, sgf, sys, math, random, time, datetime, collections, mctsGo, gameGo, goSpielNoGraph, shutil
+import copy, os, sgf, sys, math, random, time, collections, mctsGo, gameGo, goSpielNoGraph, shutil
 
 from tensorboardX import SummaryWriter
 writer = SummaryWriter(comment="-Go")
@@ -43,10 +44,10 @@ else:
 PLAY_STATISTIK = 1  # 0: keine, 1: Summary, 2: Detail
 GEWICHT_SL_MSE = 0.75
 ZUG_MAX = 75
-MAX_STEP = 1000 # prod: 10000
+MAX_STEP = 25 # prod: 10000
 PLAY_EPISODES = 1  # prod: 5000
-MCTS_SEARCHES = 20  # prod: 40, bei kein Minibatch 300
-MCTS_BATCH_SIZE = 8 # 0, wenn kein Minibatch, sonst 8
+MCTS_SEARCHES = 200  # prod: 40, bei kein Minibatch 300
+MCTS_BATCH_SIZE = 0 # 0, wenn kein Minibatch, sonst 8
 MCTS_SEARCHES_EVAL = MCTS_SEARCHES  # testing: 8, prod:
 MCTS_BATCH_SIZE_EVAL = MCTS_BATCH_SIZE  # 0, wenn kein Minibatch
 REPLAY_BUFFER = 10000 # prod: 100.000
@@ -56,7 +57,7 @@ TRAIN_ROUNDS = 250 # prod: 30 oder viel mehr
 MIN_REPLAY_TO_TRAIN = 500   # muss größer BATCH_SIZE sein, prod: 1000
 BEST_NET_WIN_RATIO = 0.55 # auch 0.6 probieren
 EVALUATE_EVERY_STEP = 50 # prod: 200
-PRINT_EVERY_STEP = EVALUATE_EVERY_STEP/2
+PRINT_EVERY_STEP = EVALUATE_EVERY_STEP/50
 EVALUATION_ROUNDS = 10   # prod: 80
 STEPS_BEFORE_TAU_0 = 15
 
@@ -242,6 +243,7 @@ def play_game(mcts_stores, replay_buffer, net1, net2, steps_before_tau_0,
     countSearch = mcts_searches * mcts_batch_size if mcts_batch_size > 0 else mcts_searches
     tau = 1 if steps_before_tau_0 > 0 else 0
     game_history = []
+    values, zuege = [], []
     result = None
     net1_result = None
     while result is None:
@@ -259,10 +261,9 @@ def play_game(mcts_stores, replay_buffer, net1, net2, steps_before_tau_0,
             print('Counts:')
             gameGo.printBrett(counts, istFlat=True)
             spiel.setzZug(81)
-#        else:
-#            print('action:', action, 'player:', cur_player, 'value:', end='')
-#            print('%3.2f ' % (mcts_stores[1-cur_player].stateStats.b[state][2][action]))
-
+        elif PLAY_STATISTIK == 1:
+            zuege.append(action)
+            values.append('%1.2f ' % (mcts_stores[1-cur_player].stateStats.b[state][2][action]))
         game_history.append((state, cur_player, probs))
         if PLAY_STATISTIK > 0 and stat != 'nicht':
             board7 = gameGo.intToB(state)
@@ -280,6 +281,8 @@ def play_game(mcts_stores, replay_buffer, net1, net2, steps_before_tau_0,
                     print('')
         if spiel.spielBeendet:
 #            print('Gewinner:', spiel.gewinner, 'S:', spiel.pktSchwarz, 'W:', spiel.pktWeiss)
+            if PLAY_STATISTIK == 1:
+                spiel.sgfWrite(zuege, values)
             if spiel.gewinner == 1:
                 net1_result = 1
                 if cur_player == 1:
@@ -378,6 +381,10 @@ def trainMCTS(net, aufsatz, device):
                         steps_before_tau_0=STEPS_BEFORE_TAU_0, mcts_searches=MCTS_SEARCHES,
                         mcts_batch_size= MCTS_BATCH_SIZE, device=device)
             game_steps += steps
+#        tUsed = round(time.time() - t)
+#        minUsed = tUsed // 60
+#        secUsed = tUsed % 60
+#        print('nach play_game %02d:%02d' % (minUsed, secUsed))
         if step_idx % PRINT_EVERY_STEP == 0:
             game_nodes = len(mcts_store) - prev_nodes
             prev_nodes = len(mcts_store)
@@ -441,8 +448,8 @@ def trainMCTS(net, aufsatz, device):
                 mcts_store.clear()
     tUsed = round(time.time() - t)
     stdUsed = tUsed // 3600
-    minUsed = (tUsed - stdUsed) // 60
-    secUsed = (tUsed - stdUsed) % 60
+    minUsed = (tUsed - 3600*stdUsed) // 60
+    secUsed = (tUsed - 3600*stdUsed) % 60
     print('Verbrauchte Zeit für trainMCTS: %02d:%02d:%02d' % (stdUsed, minUsed, secUsed))
     tUsed = round(tUsed / MAX_STEP)
     minUsed = tUsed // 60
@@ -468,19 +475,19 @@ def showWeights(model): # alter Stand
             break
 
 def predict(b7, model, mitPrint = False):
-    net = torch.load(dirSave+'/go_'+model+'.pt')
-    device = 'cpu'
-    net = net.to(device)
+    net = torch.load(dirSave+'/go_'+model+'.pt', map_location=torch.device('cpu'))
     p, _ = net(torch.FloatTensor([b7]))
     p = p.detach().numpy()[0]
     board, _, __ = gameGo.b7To3(b7)
-    b_reshape = np.asarray(board).reshape(1, gameGo.size2)
-    maxInd = [-1] *  gameGo.size2
-    for i in range(gameGo.size2):
+    b_reshape = np.asarray(board).reshape(1, gameGo.size2)[0]
+    z = np.zeros(1, dtype=int)
+    b = np.concatenate((b_reshape, z))
+    maxInd = [-1] *  gameGo.ANZ_POSITIONS
+    for i in range(gameGo.ANZ_POSITIONS):
         maxInd[i] = np.argmax(p)
         p[maxInd[i]] = -100
-    for i in range(gameGo.size2):
-        if b_reshape[0][maxInd[i]] == 0:
+    for i in range(gameGo.ANZ_POSITIONS):
+        if b[maxInd[i]] == 0:
             if i > 0 and mitPrint:
                 print('nur '+str(i+1)+'-beste Prediction')
             return maxInd[i]
@@ -625,7 +632,7 @@ def main():
     net = NnGo()
     net = net.float()
     device = torch.device(DEVICE)
-    # jnSL = input(' Training mit SL? (J), Use SL (U) oder nicht (N) : ')
+#    jnSL = input(' Training mit SL? (J), Use SL (U) oder nicht (N) : ')
     jnSL = sys.argv[1]
     if jnSL == 'J':
         trainSL(net)
@@ -634,7 +641,7 @@ def main():
         if jnSL == 'U':
             net = torch.load(dirSave+'/go_SL.pt')
             net = net.to(device)
-        # jnRL = input(' Training mit MCTS? (J, Fortsetzen mit i (RLi), oder N) : ')
+#        jnRL = input(' Training mit MCTS? (J, Fortsetzen mit i (RLi), oder N) : ')
         jnRL = sys.argv[2]
         if jnRL == 'J':
             nr = trainMCTS(net, 0, device)
