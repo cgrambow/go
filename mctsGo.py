@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import gameGo, goSpielNoGraph
+import gameGo, goSpielNoGraph, sys
 
 class MCTS:
     """
@@ -102,8 +102,10 @@ class MCTS:
             actions.append(action)
             if spiel.spielBeendet:
                 if spiel.gewinner == cur_player:
+#                    print('findLeaf Gewinner=cur_Player:', cur_player)
                     value = -1 # the value of the final state is -1 (as it is on opponent's turn)
                 elif spiel.gewinner == 1 - cur_player:
+#                    print('findLeaf Gewinner!=cur_Player:', 1-cur_player)
                     value = 1
                 else:
                     value = 0
@@ -141,9 +143,18 @@ class MCTS:
                 # backup mit value, states, actions
                 # leaf state not stored in states + actions, so the value of the leaf will be the value of the opponent
                 cur_value = -value
-                for s, action in zip(states[::-1], actions[::-1]):
-                    self.stateStats.backup(s, action, cur_value)
+                for state, action in zip(states[::-1], actions[::-1]):
+                    self.stateStats.backup(state, action, cur_value)
                     cur_value = -cur_value
+#                if countEnd == 1:
+#                    b7 = gameGo.intToB(s)
+#                    b, _, __ = gameGo.b7To3(b7)
+#                    print('Board s:')
+#                    gameGo.printBrett(b)
+#                    for state, action in zip(states, actions):
+#                        print(action, end=' ')
+#                        print(self.stateStats.b[state][2][action], end=' ')
+#                    sys.exit()
         return countEnd
 
     def search_minibatch(self, count, s, player, net, zugNr, zugMax, device):
@@ -190,8 +201,8 @@ class MCTS:
         for value, states, actions in backup_queue:
             # leaf state not stored in states + actions, so the value of the leaf will be the value of the opponent
             cur_value = -value
-            for s, action in zip(states[::-1], actions[::-1]):
-                self.stateStats.backup(s, action, cur_value)
+            for state, action in zip(states[::-1], actions[::-1]):
+                self.stateStats.backup(state, action, cur_value)
                 cur_value = -cur_value
         return countEnd
 
