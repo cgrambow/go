@@ -11,6 +11,7 @@
 # V7: tote schlagen mit 2 fh bei auszählen
 # V8: ZUG_MAX als class par, schlageStein: fh=0, doppelt reihe var in fhUpdate
 # V9: sgfWrite
+# V10:Performance: b, b1 und neues Int statt b7
 #
 
 import os, copy, gameGo
@@ -25,7 +26,7 @@ class PlayGo:
     """
     col = ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j')
 
-    def __init__(self, b7, vonBeginn=True, zugMax=81):
+    def __init__(self, b2, vonBeginn=True, cur_player=1, zugMax=81):
         self.zugMax = max(4, zugMax)
         self.gepasst = False
         self.zugNr = 0
@@ -34,51 +35,52 @@ class PlayGo:
         self.toteSchlagen = False
         self.pktSchwarz, self.pktWeiss = 0, 0
         self.gewinner = 9                   # 9: unbestimmt, 0 unentschieden , sonst 1 | -1
-        self.farbeActual = 1-2*b7[6][0][0]  # 1 | -1, Farbe Actual ist vom letzten Zug
+        self.farbeActual = 1-2*cur_player   # 1 | -1, Farbe Actual ist vom letzten Zug
                                             #           und wird erst in SetzZug weitergeschrieben
-        self.koGefahr = False              # wird True, wenn genau 1 Stein geschlagen wird
+        self.koGefahr = False               # wird True, wenn genau 1 Stein geschlagen wird
         self.koStein = [-1, -1]
-        self.koPerLastMove = vonBeginn  # Ko-Überprüfung mittels letzten Zügen, oder Stellung = b1
+        self.koPerLastMove = vonBeginn      # Ko-Überprüfung mittels letzten Zügen, oder Stellung = b1
         self.gefangenS, self.gefangenW = 0, 0   # zählt Anzahl Gefangene
-        # instance variable für Go Board, sowie letzte 2 Boards:
+        # instance variable für Go Board, sowie letztes Board:
             # 9*9 Matrix mit Besetzung:
             # 0,1,-1 für leer,schwarz,weiß (0,0) ist oben links
             # fh: Anzahl Freiheiten
             # gr: verbundene Gruppe von gleichfarbigen Steinen, mind. 2
         self.b  = [[0] * 9 for i in range(9)]
         self.b1 = [[0] * 9 for i in range(9)]
-        self.b2 = [[0] * 9 for i in range(9)]
-        b, b1, b2 = gameGo.b7To3(b7)
         for i in range(9):
             for j in range(9):
-                self.b[i][j]  = {'farbe': b[i][j],  'fh': 0, 'gr':[]}
-                self.b1[i][j] = {'farbe': b1[i][j], 'fh': 0, 'gr':[]}
-                self.b2[i][j] = {'farbe': b2[i][j], 'fh': 0, 'gr':[]}
+                self.b[i][j]  = {'farbe': b2[0][i][j], 'fh': 0, 'gr':[]}
+                self.b1[i][j] = {'farbe': b2[1][i][j], 'fh': 0, 'gr':[]}
         if not vonBeginn:
             self.berechneFhGr()
 
-    def b12Farbe(self):
-        b  = [[0] * 9 for i in range(9)]
-        b1 = [[0] * 9 for i in range(9)]
-        b2 = [[0] * 9 for i in range(9)]
+    def bToInt(self):
+        # Codierung Board2 (b und b1) für Performance als Int mit 2**x und 3**x Konvertierung (0,0), (0,1), ...(8,8),
+        #           Ermittlung vorheriges als 0/1 Delta: 0=gleicher Stein, 1=wurde gesetzt oder geschlagen
+        #           int = (b Konv 3**x)*2**81+(Delta-b-b1 Konv 2**x)
+        num, numB = 0, 0
+        bDelta  = [[0] * 9 for i in range(9)]
         for row in range(9):
             for col in range(9):
-                b[row][col]  = self.b[row][col]['farbe']
-                b1[row][col] = self.b1[row][col]['farbe']
-                b2[row][col] = self.b2[row][col]['farbe']
-        return b, b1, b2
+                if self.b[row][col]['farbe'] != self.b1[row][col]['farbe']:
+                    bDelta[row][col] = 1
+        for row in range(9):
+            for col in range(9):
+                num += bDelta[row][col] * 2**(9*row+col)
+        for row in range(9):
+            for col in range(9):
+                numB += (self.b[row][col]['farbe']+1) * 3**(9*row+col)
+        return numB*2**81+num
 
-    def printB(self, b1=False, b2=False):
+    def printB(self, b1=False):
         board = [[0] * 9 for i in range(9)]
         for row in range(9):
             for col in range(9):
                 if b1:
                     board[row][col] = self.b1[row][col]['farbe']
-                elif b2:
-                    board[row][col] = self.b2[row][col]['farbe']
                 else:
                     board[row][col] = self.b[row][col]['farbe']
-
         gameGo.printBrett(board)
         print('')
 
@@ -161,15 +163,14 @@ class PlayGo:
                                 if self.b[nbReihe][nbSpalte]['fh'] == 2:
                                     if self.farbeActual != self.b[nbReihe][nbSpalte]['farbe']:
                                         self.setzZug(81) # pass, andere Farbe besetzt fh
-                                    b2Safe = copy.deepcopy(self.b2)
+                                    b1Safe = copy.deepcopy(self.b1)
                                     gefangenS, gefangenW = self.gefangenS, self.gefangenW
                                     if not self.setzZug(9*reihe+spalte):
                                         break   # illegaler Zug
                                     if self.b[reihe][spalte]['fh'] == 1:
                                         # Fh nach Update 1 --> Zug rückgängig machen
                                         self.b = copy.deepcopy(self.b1)
-                                        self.b1 = copy.deepcopy(self.b2)
-                                        self.b2 = copy.deepcopy(b2Safe)
+                                        self.b1 = copy.deepcopy(b1Safe)
                                         self.farbeActual = - self.farbeActual
                                         self.gefangenS, self.gefangenW = gefangenS, gefangenW
                                     else:
@@ -502,12 +503,6 @@ class PlayGo:
                         self.gewinner = 1
                     else:
                         self.gewinner = -1
-#                    if self.koPerLastMove:
-#                        print('Play_game: S:', self.pktSchwarz, ' W:', self.pktWeiss,
-#                              ' #Pass:', self.anzPass, 'Zug: ', self.zugNr)
-#                    else:
-#                        print('Find_leaf: S:', self.pktSchwarz, ' W:', self.pktWeiss,
-#                              ' #Pass:', self.anzPass, 'Zug: ', self.zugNr)
             else:
                 self.gepasst = True
                 self.koGefahr = False
@@ -524,14 +519,13 @@ class PlayGo:
                 self.gepasst = False
             else:
                 # Fh bleibt nach Update 0, oder unerlaubtes Ko-Zurückschlagen --> Zug rückgängig machen
-                self.b = copy.deepcopy(bSafe)   # nötig? oder nur Zuweisung reicht?
+                self.b = copy.deepcopy(bSafe)
                 self.farbeActual = - self.farbeActual
                 self.koGefahr = koGefahr
                 self.koStein = koStein
                 self.gefangenS, self.gefangenW = gefangenS, gefangenW
                 possible = False
         if possible:
-            self.b2 = copy.deepcopy(self.b1)
             self.b1 = copy.deepcopy(bSafe)
             if not self.toteSchlagen:
                 self.zugNr += 1
@@ -544,10 +538,4 @@ class PlayGo:
                     self.gewinner = 1
                 else:
                     self.gewinner = -1
-#                if self.koPerLastMove:
-#                    print('play_game mit ', self.zugMax, ' Zügen beendet. S:', self.pktSchwarz, ' W:', self.pktWeiss,
-#                          ' #Pass:', self.anzPass)
-#                else:
-#                    print('find_leaf mit ', self.zugMax, ' Zügen beendet. S:', self.pktSchwarz, ' W:', self.pktWeiss,
-#                          ' #Pass:', self.anzPass)
         return possible

@@ -7,8 +7,8 @@
 # # für Gewinner: Input = alle Board Positionen in denen Gewinner am Zug. Label = sein Zug
 # # Lösung mit 1 Convolution, 2 Res und 1 FullyConnected Layer
 # # In   : 2 binary Map, eine für current player, eine für Opponent (gesetzt=1, empty=0) , 9x9 Feld.
-#           Dies auch für Zug -1 und -2 (wegen Ko), und eine const. Map 1 oder 0 abh. ob S oder W current ist
-#           Also insg. 7 9x9 binary Maps
+#           Dies auch für Zug -1 (wegen Ko), und eine const. Map 1 oder 0 abh. ob S oder W current ist
+#           Also insg. 5 9x9 binary Maps
 # Reinforcement Learning: MCTS mit SelfPlay
 # V1: weiterentwickelt von der V7 Lösung für Tic-Tac-Toe
 # V2: sgf: pj und mj sind pass, setzZug mit möglichem Return False
@@ -19,7 +19,9 @@
 # V7: drehung
 # V8: ZUG_MAX bei SL 81
 # V9: GPU
-# V10:predict auf ANZ_POSITIONS geändert, sgfWrite bei playGame
+# V10:predict auf ANZ_POSITIONS geändert, sgfWrite bei playGame, argparse
+# V11:Performance: b, b1 und neues Int statt b7
+# V12:timer
 #
 import torch, torch.cuda
 import torch.nn as nn
@@ -27,7 +29,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 import numpy as np
-import copy, os, sgf, sys, math, random, time, collections, mctsGo, gameGo, goSpielNoGraph, shutil
+import copy, os, sgf, sys, math, random, collections, mctsGo, gameGo, goSpielNoGraph, shutil, argparse
 
 from tensorboardX import SummaryWriter
 writer = SummaryWriter(comment="-Go")
@@ -41,35 +43,36 @@ else:
     DEVICE = 'cpu'
     dirSave = '/Users/kai/Documents/Python/ML/goNN'
 
-PLAY_STATISTIK = 1  # 0: keine, 1: Summary, 2: Detail
+PLAY_STATISTIK = 0  # 0: keine, 1: Summary, 2: Detail
 GEWICHT_SL_MSE = 0.75
-ZUG_MAX = 75
-MAX_STEP = 25 # prod: 10000
+ZUG_MAX = 90
+
+MAX_STEP = 1000 # prod: 10000
 PLAY_EPISODES = 1  # prod: 5000
-MCTS_SEARCHES = 200  # prod: 40, bei kein Minibatch 300
-MCTS_BATCH_SIZE = 0 # 0, wenn kein Minibatch, sonst 8
+MCTS_SEARCHES = 20  # prod: 20, bei kein Minibatch 300
+MCTS_BATCH_SIZE = 6 # 0, wenn kein Minibatch, sonst 6 oder 8
 MCTS_SEARCHES_EVAL = MCTS_SEARCHES  # testing: 8, prod:
 MCTS_BATCH_SIZE_EVAL = MCTS_BATCH_SIZE  # 0, wenn kein Minibatch
-REPLAY_BUFFER = 10000 # prod: 100.000
-LEARNING_RATE = 0.1    # auch 0.01 für MCTS Training probieren
+REPLAY_BUFFER = 5000 # prod: 100.000
+LEARNING_RATE = 0.05    # prod: 0.1, auch 0.01 für MCTS Training probieren
 BATCH_SIZE = 128    # prod: 128
-TRAIN_ROUNDS = 250 # prod: 30 oder viel mehr
+TRAIN_ROUNDS = 300 # prod: 30 oder viel mehr
 MIN_REPLAY_TO_TRAIN = 500   # muss größer BATCH_SIZE sein, prod: 1000
 BEST_NET_WIN_RATIO = 0.55 # auch 0.6 probieren
 EVALUATE_EVERY_STEP = 50 # prod: 200
-PRINT_EVERY_STEP = EVALUATE_EVERY_STEP/50
+PRINT_EVERY_STEP = EVALUATE_EVERY_STEP/5
 EVALUATION_ROUNDS = 10   # prod: 80
 STEPS_BEFORE_TAU_0 = 15
 
 class NnGo(nn.Module):
 
     def __init__(self):
-        ANZ_CONV_FILTER = 8 # auch 16 oder 32 probieren
-        FC_HIDDEN = 16      # auch 8 oder 32 probieren
+        ANZ_CONV_FILTER = 32 # auch 16 oder 32 probieren
+        FC_HIDDEN = 32      # auch 8 oder 32 probieren
         super(NnGo, self).__init__()
 
         self.conv = nn.Sequential(
-            nn.Conv2d(7, ANZ_CONV_FILTER, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(5, ANZ_CONV_FILTER, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(ANZ_CONV_FILTER),
             nn.LeakyReLU()
         )
@@ -80,6 +83,16 @@ class NnGo(nn.Module):
             nn.LeakyReLU()
         )
         self.convRes2 = nn.Sequential(
+            nn.Conv2d(ANZ_CONV_FILTER, ANZ_CONV_FILTER, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(ANZ_CONV_FILTER),
+            nn.LeakyReLU()
+        )
+        self.convRes3 = nn.Sequential(
+            nn.Conv2d(ANZ_CONV_FILTER, ANZ_CONV_FILTER, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(ANZ_CONV_FILTER),
+            nn.LeakyReLU()
+        )
+        self.convRes4 = nn.Sequential(
             nn.Conv2d(ANZ_CONV_FILTER, ANZ_CONV_FILTER, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(ANZ_CONV_FILTER),
             nn.LeakyReLU()
@@ -108,6 +121,8 @@ class NnGo(nn.Module):
         out = self.conv(x)
         out = out + self.convRes1(out)
         out = out + self.convRes2(out)
+        out = out + self.convRes3(out)
+        out = out + self.convRes4(out)
         outPol = self.policy1(out)
         outVal = self.value1(out)
         outPol = self.policy2(outPol.view(batch_size, -1))
@@ -118,7 +133,7 @@ def trainSL(net):
     optimizer = optim.SGD(net.parameters(), lr=LEARNING_RATE, momentum=0.9)
     os.chdir('/Users/kai/Documents/Python/ML/go9x9')
     dateien = os.listdir(".")
-    buffer = collections.deque()    # mit board7, whoMoves, probs, value
+    buffer = collections.deque()    # mit board2-Int, whoMoves, probs, value
     # teach aus einigen Spielen
     for datei in dateien:
         if datei.endswith(".sgf"):
@@ -131,7 +146,7 @@ def trainSL(net):
                 print('Noch kein Gewinner')
                 continue
             for drehung in (0, 90, 180, 270, 1, 2, 3, 4):
-                spiel = goSpielNoGraph.PlayGo(gameGo.b7Initial)
+                spiel = goSpielNoGraph.PlayGo(gameGo.b2Initial)
                 passM1 = False
                 for node in collection[0].rest:
                     for k, v in node.properties.items():
@@ -171,12 +186,10 @@ def trainSL(net):
                             reihe, spalte = gameGo.dreh(reihe, spalte, drehung)
                             probs = [0] * gameGo.ANZ_POSITIONS
                             probs[gameGo.size*reihe+spalte] = 1
-                            b, b1, b2 = spiel.b12Farbe()
-                            board7 = gameGo.b12To7(b, b1, b2, player)
                             if k == gewinner:
-                                buffer.append((board7, player, probs, 1))
+                                buffer.append((spiel.bToInt(), player, probs, 1))
                             else:
-                                buffer.append((board7, player, probs, -1))
+                                buffer.append((spiel.bToInt(), player, probs, -1))
                             position = gameGo.size * reihe + spalte
                             if not spiel.setzZug(position):
                                 print('Unerlaubter Zug: Reihe='+str(reihe)+' Spalte='+str(spalte))
@@ -195,8 +208,8 @@ def trainSL(net):
     for _ in range(len(buffer)//batch_size):
         batch = random.sample(buffer, batch_size)
         batch_states, batch_who_moves, batch_probs, batch_values = zip(*batch)
-        batch_states = np.array(batch_states, dtype=float)
-        states_v = torch.from_numpy(batch_states).float()
+        batch_states_lists = [gameGo.intToB(state) for state in batch_states]
+        states_v = gameGo.state_lists_to_batch(batch_states_lists, batch_who_moves)
         optimizer.zero_grad()
         probs_v = torch.FloatTensor(batch_probs)
         values_v = torch.FloatTensor(batch_values)
@@ -227,14 +240,14 @@ def play_game(mcts_stores, replay_buffer, net1, net2, steps_before_tau_0,
                 Unterschiede MCTS vs NN wird bei letztem Evaluate Spiel bestimmt
                 kann insg. über PLAY_STATISTIK gesteuert werden: aus, nur-Summary, detailliert
     """
-    assert isinstance(replay_buffer, (collections.deque, type(None)))
-    assert isinstance(mcts_stores, (mctsGo.MCTS, type(None), list))
-    assert isinstance(net1, NnGo)
-    assert isinstance(net2, NnGo)
+#    assert isinstance(replay_buffer, (collections.deque, type(None)))
+#    assert isinstance(mcts_stores, (mctsGo.MCTS, type(None), list))
+#    assert isinstance(net1, NnGo)
+#    assert isinstance(net2, NnGo)
     if isinstance(mcts_stores, mctsGo.MCTS):
         mcts_stores = [mcts_stores, mcts_stores]
-    spiel = goSpielNoGraph.PlayGo(gameGo.b7Initial, zugMax=ZUG_MAX)
-    state = gameGo.bToInt(gameGo.b7Initial)
+    spiel = goSpielNoGraph.PlayGo(gameGo.b2Initial, zugMax=ZUG_MAX)
+    state = spiel.bToInt()
     nets = [net1, net2]
     cur_player = 1 # schwwarz beginnt immer, und das ist net1
     step = 0
@@ -244,32 +257,32 @@ def play_game(mcts_stores, replay_buffer, net1, net2, steps_before_tau_0,
     tau = 1 if steps_before_tau_0 > 0 else 0
     game_history = []
     values, zuege = [], []
-    result = None
-    net1_result = None
-    while result is None:
+    while True:
         statEnd = mcts_stores[1-cur_player].search(mcts_searches, mcts_batch_size, state, cur_player,
                                         nets[1-cur_player], zugNr = step+1, zugMax=ZUG_MAX, device=device)
         countEnd += statEnd
         probs = mcts_stores[1-cur_player].get_policy(state, tau=tau)
+        game_history.append((state, cur_player, probs))
         action = np.random.choice(gameGo.ANZ_POSITIONS, p=probs)
         if not spiel.setzZug(action):   # hier move: setzen eines Zuges
             print('Impossible action at step ', step, ', Player: ', cur_player, '. Action=', action, ' at:')
             spiel.printB()
+            print('b1:')
+            spiel.printB(b1=True)
             print('mit probs:')
             gameGo.printBrett(probs, istFlat=True, mitFloat=True)
             counts = mcts_stores[1-cur_player].stateStats.b[state][0]
             print('Counts:')
             gameGo.printBrett(counts, istFlat=True)
-            spiel.setzZug(81)
+            counts[action] = 0
+            if not spiel.setzZug(np.argmax(counts)):
+                spiel.setzZug(81)
         elif PLAY_STATISTIK == 1:
             zuege.append(action)
             values.append('%1.2f ' % (mcts_stores[1-cur_player].stateStats.b[state][2][action]))
-        game_history.append((state, cur_player, probs))
         if PLAY_STATISTIK > 0 and stat != 'nicht':
-            board7 = gameGo.intToB(state)
-            board7 = np.array([board7], dtype=float)
-            board7 = torch.from_numpy(board7).float().to(device)
-            p_v, _ = nets[1-cur_player](board7)
+            batch_v = gameGo.state_lists_to_batch([gameGo.intToB(state)], [cur_player], device)
+            p_v, _ = nets[1-cur_player](batch_v)
             probs = p_v.detach().cpu().numpy()[0]
             position = np.argmax(probs)
             if position != action:
@@ -300,8 +313,7 @@ def play_game(mcts_stores, replay_buffer, net1, net2, steps_before_tau_0,
                 net1_result = 0
             break
         cur_player = 1-cur_player
-        b, b1, b2 = spiel.b12Farbe()
-        state = gameGo.bToInt(gameGo.b12To7(b, b1, b2, cur_player))
+        state = spiel.bToInt()
         step += 1
         if step >= steps_before_tau_0:
             tau = 0
@@ -314,7 +326,7 @@ def play_game(mcts_stores, replay_buffer, net1, net2, steps_before_tau_0,
     if replay_buffer is not None:
         for state, cur_player, probs in reversed(game_history):
             for drehung in (0, 90, 180, 270, 1, 2, 3, 4):
-                replay_buffer.append((gameGo.drehB7(state, drehung), cur_player,
+                replay_buffer.append((gameGo.drehB2(state, drehung), cur_player,
                                       gameGo.drehPosition(probs, drehung), result))
             result = -result
     return net1_result, step
@@ -371,24 +383,23 @@ def trainMCTS(net, aufsatz, device):
     bestNet = NnGo()
     bestNet = bestNet.float()
     bestNet = copy.deepcopy(net)
-    t = time.time()
+    timeTrain = gameGo.GoTimer('trainMCTS', mitGesamt=True)
+    timeGame = gameGo.GoTimer('play_game')
     prev_nodes = 0
-    for step_idx in range(1, MAX_STEP+1):    # endless
+    for step_idx in range(1, MAX_STEP+1):
         game_steps = 0
-#        print('Train step: ', step_idx)
+        timeTrain.start()
+        timeGame.start()
         for _ in range(PLAY_EPISODES):
             _, steps = play_game(mcts_store, replay_buffer, bestNet, bestNet,
                         steps_before_tau_0=STEPS_BEFORE_TAU_0, mcts_searches=MCTS_SEARCHES,
                         mcts_batch_size= MCTS_BATCH_SIZE, device=device)
             game_steps += steps
-#        tUsed = round(time.time() - t)
-#        minUsed = tUsed // 60
-#        secUsed = tUsed % 60
-#        print('nach play_game %02d:%02d' % (minUsed, secUsed))
+        timeGame.stop()
         if step_idx % PRINT_EVERY_STEP == 0:
             game_nodes = len(mcts_store) - prev_nodes
             prev_nodes = len(mcts_store)
-            print("Step %d, steps %3d, new leaves %3d, best_idx %d, replay size %d" % (
+            print("Step %d, Moves last step %3d, New leaves %3d, Best net %d, Replay size %d" % (
                 step_idx, game_steps, game_nodes, best_idx, len(replay_buffer)))
         if len(replay_buffer) < MIN_REPLAY_TO_TRAIN:
             continue
@@ -396,15 +407,11 @@ def trainMCTS(net, aufsatz, device):
         sum_loss = 0.0
         sum_value_loss = 0.0
         sum_policy_loss = 0.0
-
         for _ in range(TRAIN_ROUNDS):
             batch = random.sample(replay_buffer, BATCH_SIZE)
             batch_states, batch_who_moves, batch_probs, batch_values = zip(*batch)
-            b7_states = []
-            for s in batch_states:
-                b7_states.append(gameGo.intToB(s))
-            b7_states = np.array(b7_states, dtype=float)
-            states_v = torch.from_numpy(b7_states).float().to(device)
+            batch_states_lists = [gameGo.intToB(state) for state in batch_states]
+            states_v = gameGo.state_lists_to_batch(batch_states_lists, batch_who_moves, device)
             optimizer.zero_grad()
             probs_v = torch.FloatTensor(batch_probs).to(device)
             values_v = torch.FloatTensor(batch_values).to(device)
@@ -424,11 +431,11 @@ def trainMCTS(net, aufsatz, device):
             lossTot = sum_loss/TRAIN_ROUNDS
             lossPol = sum_policy_loss/TRAIN_ROUNDS
             lossVal = sum_value_loss/TRAIN_ROUNDS
-            print('loss_total: '+str(lossTot)+', loss_value: '+str(lossVal)+', loss_policy: '+str(lossPol))
+            print("loss_total: %1.2f, loss_value: %1.2f, loss_policy: %1.2f" % (lossTot, lossVal, lossPol))
             writer.add_scalar("loss_total",lossTot , step_idx)
             writer.add_scalar("loss_value",lossVal , step_idx)
             writer.add_scalar("loss_policy",lossPol , step_idx)
-
+        timeTrain.stop()
         # evaluate net
         if step_idx % EVALUATE_EVERY_STEP == 0:
             win_ratio = evaluate(net, bestNet, rounds=EVALUATION_ROUNDS, device=device)
@@ -446,15 +453,8 @@ def trainMCTS(net, aufsatz, device):
                 ###showWeights(model)
                 test(model, printNurSummary=True)
                 mcts_store.clear()
-    tUsed = round(time.time() - t)
-    stdUsed = tUsed // 3600
-    minUsed = (tUsed - 3600*stdUsed) // 60
-    secUsed = (tUsed - 3600*stdUsed) % 60
-    print('Verbrauchte Zeit für trainMCTS: %02d:%02d:%02d' % (stdUsed, minUsed, secUsed))
-    tUsed = round(tUsed / MAX_STEP)
-    minUsed = tUsed // 60
-    secUsed = tUsed % 60
-    print('                      pro Step:    %02d:%02d' % (minUsed, secUsed))
+    timeTrain.timerPrint()
+    timeGame.timerPrint()
     return best_idx
 
 def showWeights(model): # alter Stand
@@ -474,11 +474,11 @@ def showWeights(model): # alter Stand
                                       +str(input+1)+', row/col '+str(row+1)+str(col+1))
             break
 
-def predict(b7, model, mitPrint = False):
+def predict(b5, model, mitPrint = False):
     net = torch.load(dirSave+'/go_'+model+'.pt', map_location=torch.device('cpu'))
-    p, _ = net(torch.FloatTensor([b7]))
+    p, _ = net(torch.FloatTensor([b5]))
     p = p.detach().numpy()[0]
-    board, _, __ = gameGo.b7To3(b7)
+    board, _ = gameGo.b5To2(b5)
     b_reshape = np.asarray(board).reshape(1, gameGo.size2)[0]
     z = np.zeros(1, dtype=int)
     b = np.concatenate((b_reshape, z))
@@ -494,9 +494,9 @@ def predict(b7, model, mitPrint = False):
     print('Board ist voll!')
 
 def test(model, printNurSummary=False):
-    def testBoard(b, b1, b2, whoMoves, soll):
+    def testBoard(b, b1, whoMoves, soll):
         # return Erfolg 1/0
-        y_pred = predict(gameGo.b12To7(b, b1, b2, whoMoves), model=model, mitPrint=not printNurSummary)
+        y_pred = predict(gameGo.b1To5(b, b1, whoMoves), model=model, mitPrint=not printNurSummary)
         if not printNurSummary:
             gameGo.printBrett(b)
             print('Nächster Zug sollte sein: ', end='')
@@ -531,15 +531,6 @@ def test(model, printNurSummary=False):
                          [0,  0,  0,  0,  0,  0,  0,  0,  0],
                          [0,  0,  0,  0,  0,  0,  0,  0,  0],
                          [0,  0,  0,  0,  0,  0,  0,  0,  0]],
-                        [[0, -1,  1, -1,  0,  0,  0,  0,  0],
-                         [0, -1,  1, -1,  0,  0,  0,  0,  0],
-                         [0, -1,  1, -1,  0,  0,  0,  0,  0],
-                         [0, -1,  1,  0,  0,  0,  0,  0,  0],
-                         [0,  1,  0,  1,  0,  0,  0,  0,  0],
-                         [0,  1,  0,  1,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0]],
                          0, [38])
     erfolg += testBoard([[0,  1, -1, -1,  1,  0,  0,  0,  0],
                          [0,  1, -1,  0,  1,  0,  0,  0,  0],
@@ -553,15 +544,6 @@ def test(model, printNurSummary=False):
                         [[0,  1, -1, -1,  1,  0,  0,  0,  0],
                          [0,  1, -1,  0,  1,  0,  0,  0,  0],
                          [0,  0,  1,  0,  1,  0,  0,  0,  0],
-                         [0,  0,  1,  1,  0,  0,  0,  0,  0],
-                         [0, -1, -1, -1,  0,  0,  0,  0,  0],
-                         [0, -1,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0]],
-                        [[0,  1, -1, -1,  1,  0,  0,  0,  0],
-                         [0,  1, -1,  0,  1,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  1,  0,  0,  0,  0],
                          [0,  0,  1,  1,  0,  0,  0,  0,  0],
                          [0, -1, -1, -1,  0,  0,  0,  0,  0],
                          [0, -1,  0,  0,  0,  0,  0,  0,  0],
@@ -587,15 +569,6 @@ def test(model, printNurSummary=False):
                          [0,  0,  0,  0,  0,  0,  0,  0,  0],
                          [0,  0,  0,  0,  0,  0,  0,  0,  0],
                          [0,  0,  0,  0,  0,  0,  0,  0,  0]],
-                        [[0, -1, -1, -1,  0,  0,  0,  0,  0],
-                         [0, -1, -1, -1,  1,  0,  0,  0,  0],
-                         [1,  1,  0,  0,  1,  0,  0,  0,  0],
-                         [0, -1, -1,  0,  0,  0,  0,  0,  0],
-                         [0,  1,  0,  1,  0,  0,  0,  0,  0],
-                         [0,  1,  1,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0]],
                          1, [21])
     erfolg += testBoard([[0, -1, -1, -1,  0,  0,  0,  0,  0],
                          [0, -1, -1, -1,  1,  0,  0,  0,  0],
@@ -615,15 +588,6 @@ def test(model, printNurSummary=False):
                          [0,  0,  0,  0,  0,  0,  0,  0,  0],
                          [0,  0,  0,  0,  0,  0,  0,  0,  0],
                          [0,  0,  0,  0,  0,  0,  0,  0,  0]],
-                        [[0, -1, -1, -1,  0,  0,  0,  0,  0],
-                         [0, -1, -1, -1,  1,  0,  0,  0,  0],
-                         [1,  1,  1,  0,  0,  0,  0,  0,  0],
-                         [0, -1, -1,  0,  0,  0,  0,  0,  0],
-                         [0,  1,  1,  1,  0,  0,  0,  0,  0],
-                         [0,  1,  1,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0],
-                         [0,  0,  0,  0,  0,  0,  0,  0,  0]],
                          0, [21])
     anzTests = 4
     print('Testerfolg = '+str(erfolg)+' von '+str(anzTests))
@@ -632,34 +596,41 @@ def main():
     net = NnGo()
     net = net.float()
     device = torch.device(DEVICE)
-#    jnSL = input(' Training mit SL? (J), Use SL (U) oder nicht (N) : ')
-    jnSL = sys.argv[1]
-    if jnSL == 'J':
+
+    help1 = "Training mit SL? (J), Use SL (U) oder nicht (N): "
+    help2 = "Training mit MCTS? (J, Fortsetzen mit i (RLi), oder N): "
+    parser = argparse.ArgumentParser(description='Train Go NN with SL or MCTS')
+    parser.add_argument("-jnSL", choices=['J', 'U', 'N'], help=help1)
+    parser.add_argument("-jnRL", help=help2)
+    args = parser.parse_args()
+    if not args.jnSL:
+        args.jnSL = input(help1)
+    if args.jnSL == 'J':
         trainSL(net)
         model = 'SL'
     else:
-        if jnSL == 'U':
+        if args.jnSL == 'U':
             net = torch.load(dirSave+'/go_SL.pt')
             net = net.to(device)
-#        jnRL = input(' Training mit MCTS? (J, Fortsetzen mit i (RLi), oder N) : ')
-        jnRL = sys.argv[2]
-        if jnRL == 'J':
+        if not args.jnRL:
+            args.jnRL = input(help2)
+        if args.jnRL == 'J':
             nr = trainMCTS(net, 0, device)
             if nr == 0:
                 print('RL hat Net nicht verbessert :-(')
                 sys.exit()
             model = 'RL'+str(nr)
-        elif jnRL == 'N':
+        elif args.jnRL == 'N':
             nr = input('welches existierende RL Modell soll predicted werden, oder 0 für SL: ')
             if nr == '0':
                 model = 'SL'
             else:
                 model = 'RL' + nr
         else:
-            net = torch.load(dirSave+'/go_RL'+jnRL+'.pt')
+            net = torch.load(dirSave+'/go_RL'+args.jnRL+'.pt')
             net = net.to(device)
-            nr = trainMCTS(net, int(jnRL), device)
-            if nr-int(jnRL) == 0:
+            nr = trainMCTS(net, int(args.jnRL), device)
+            if nr-int(args.jnRL) == 0:
                 print('RL hat Net nicht verbessert :-(')
                 sys.exit()
             model = 'RL'+str(nr)

@@ -6,6 +6,8 @@
 #       zugNr Par zu mcts search
 # V4: zugMax
 # V5: GPU
+# V6: Performance: b, b1 und neues Int statt b7
+# V7: find Leaf value Korrektur
 #
 """
 Monte-Carlo Tree Search
@@ -16,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import gameGo, goSpielNoGraph, sys
+import gameGo, goSpielNoGraph
 
 class MCTS:
     """
@@ -55,7 +57,8 @@ class MCTS:
         actions = []
         cur_state = s
         cur_player = player
-        spiel = goSpielNoGraph.PlayGo(gameGo.intToB(cur_state), vonBeginn=False, zugMax=zugMax-zugNr)
+        spiel = goSpielNoGraph.PlayGo(gameGo.intToB(cur_state), cur_player=cur_player,
+                                      vonBeginn=False, zugMax=zugMax-zugNr)
         value = None
         while not self.is_leaf(cur_state):
             # not leaf
@@ -87,34 +90,22 @@ class MCTS:
                     noises = np.random.dirichlet(alpha)
                     n = np.hstack((noises, np.zeros(1)))
                 probs = [0.75 * prob + 0.25 * noise for prob, noise in zip(probs, n)]
-            score = [value + prob * total_sqrt / (1 + count)
-                     for value, prob, count in zip(values, probs, counts)]
+            score = [val + prob * total_sqrt / (1 + count)
+                     for val, prob, count in zip(values, probs, counts)]
             # possible_moves: Feld nicht besetzt. Und dann iterativ ausprobieren
             for i in range(gameGo.size2):
                 if spiel.b[i//gameGo.size][i%gameGo.size]['farbe'] != 0:
                     score[i] = -np.inf
             action = int(np.argmax(score))
             while not spiel.setzZug(action):    # hier move: setzen eines Zuges
-#                print('Illegaler Zug ', action, ' des Spielers ', cur_player, ' in Stellung:')
-#                spiel.printB()
                 score[action] = -np.inf
                 action = int(np.argmax(score))
             actions.append(action)
             if spiel.spielBeendet:
-                if spiel.gewinner == cur_player:
-#                    print('findLeaf Gewinner=cur_Player:', cur_player)
-                    value = -1 # the value of the final state is -1 (as it is on opponent's turn)
-                elif spiel.gewinner == 1 - cur_player:
-#                    print('findLeaf Gewinner!=cur_Player:', 1-cur_player)
-                    value = 1
-                else:
-                    value = 0
+                value = spiel.gewinner*(1-2*cur_player) # value aus Sicht des Gegners, siehe backup)
                 break
             cur_player = 1 - cur_player
-            b, b1, b2 = spiel.b12Farbe()
-            cur_state = gameGo.bToInt(gameGo.b12To7(b, b1, b2, cur_player))
-            if value:
-                break
+            cur_state = spiel.bToInt()
         return value, cur_state, cur_player, states, actions
 
     def search(self, count, batch_size, s, player, net, zugNr, zugMax, device):
@@ -129,10 +120,8 @@ class MCTS:
                 value, leaf_state, leaf_player, states, actions = self.find_leaf(s, player, zugNr, zugMax)
                 if value is None:
                     # expand mit leaf_state, leaf_player, states, actions
-                    board7 = gameGo.intToB(leaf_state)   ### leaf_player unnötig
-                    board7 = np.array([board7], dtype=float)
-                    board7 = torch.from_numpy(board7).float().to(device)
-                    logits_v, value_v = net(board7)
+                    batch_v = gameGo.state_lists_to_batch([gameGo.intToB(leaf_state)], [leaf_player], device)
+                    logits_v, value_v = net(batch_v)
                     probs_v = F.softmax(logits_v, dim=1)
                     probs = probs_v.detach().cpu().numpy()[0]
                     value = value_v.data.cpu().numpy()[0][0]
@@ -140,21 +129,20 @@ class MCTS:
                     self.stateStats.expand(leaf_state, probs)
                 else:
                     countEnd += 1
+                    print('Leaf bis Spielende.')
+                    cv = -value
+                    cp = leaf_player
+                    for state, action in zip(states[::-1], actions[::-1]):
+                        print('backup mit action: ', action, 'player: ', cp, ' value: ', cv, ' bei:')
+                        cv = -cv
+                        cp = 1-cp
+                        gameGo.printBrett(gameGo.intToB(state)[0])
                 # backup mit value, states, actions
                 # leaf state not stored in states + actions, so the value of the leaf will be the value of the opponent
                 cur_value = -value
                 for state, action in zip(states[::-1], actions[::-1]):
                     self.stateStats.backup(state, action, cur_value)
                     cur_value = -cur_value
-#                if countEnd == 1:
-#                    b7 = gameGo.intToB(s)
-#                    b, _, __ = gameGo.b7To3(b7)
-#                    print('Board s:')
-#                    gameGo.printBrett(b)
-#                    for state, action in zip(states, actions):
-#                        print(action, end=' ')
-#                        print(self.stateStats.b[state][2][action], end=' ')
-#                    sys.exit()
         return countEnd
 
     def search_minibatch(self, count, s, player, net, zugNr, zugMax, device):
@@ -179,17 +167,13 @@ class MCTS:
                         found = True
                         break
                 if not found:
-                    expand_states.append(leaf_state)
+                    expand_states.append(gameGo.intToB(leaf_state))
                     expand_players.append(leaf_player)
                     expand_queue.append((leaf_state, states, actions))
         # expansion of nodes
         if expand_queue:
-            boards7 = []
-            for s, player in zip(expand_states, expand_players):
-                boards7.append(gameGo.intToB(s))
-            boards7 = np.array(boards7, dtype=float)
-            boards7 = torch.from_numpy(boards7).float().to(device)
-            logits_v, values_v = net(boards7)
+            batch_v = gameGo.state_lists_to_batch(expand_states, expand_players, device)
+            logits_v, values_v = net(batch_v)
             probs_v = F.softmax(logits_v, dim=1)
             values = values_v.data.cpu().numpy()[:,0]
             probs = probs_v.detach().cpu().numpy()
@@ -220,9 +204,9 @@ class MCTS:
             counts = [count ** (1.0 / tau) for count in counts]
             total = sum(counts)
             if total == 0:  ### sollte NICHT passieren
-                print('mcts.get_policy mit sum(count)=0, bei: ', end='')
-                b, _, __ = gameGo.b7To3(gameGo.intToB(s))
-                gameGo.printBrett(b)
+                print('mcts.get_policy mit sum(count)=0, bei:')
+                b2 = gameGo.intToB(s)
+                gameGo.printBrett(b2[0])
                 probs = self.stateStats.b[s][2]
             else:
                 probs = [count / total for count in counts]
